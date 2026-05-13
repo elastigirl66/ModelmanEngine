@@ -1,0 +1,427 @@
+name: '📌 Pinterest'
+
+on:
+  workflow_dispatch:
+    inputs:
+      search_query:
+        description: 'What to search for on Pinterest (e.g. "منظره زیبا" or "mountain sunset")'
+        required: true
+        default: 'nature'
+      store_history:
+        description: 'Save a copy in History/ folder?'
+        required: false
+        default: true
+        type: boolean
+      download_images:
+        description: 'Download images from the page?'
+        required: false
+        default: true
+        type: boolean
+      save_pdf:
+        description: 'Save a PDF snapshot of the page?'
+        required: false
+        default: true
+        type: boolean
+      image_formats:
+        description: 'Image formats to download (comma‑separated, e.g. jpg,jpeg,png,gif)'
+        required: false
+        default: 'jpg,jpeg,png,gif'
+      start_index:
+        description: 'Start index of images (1 = first image)'
+        required: false
+        default: 1
+        type: number
+      end_index:
+        description: 'End index of images'
+        required: false
+        default: 20
+        type: number
+      expand_sections:
+        description: 'Expand all sections by default (otherwise they are collapsed)'
+        required: false
+        default: true
+        type: boolean
+      clean_text:
+        description: 'Remove extra line breaks from extracted text (makes it more readable)'
+        required: false
+        default: true
+        type: boolean
+      timeout_seconds:
+        description: 'Page load timeout in seconds (increase if website is slow)'
+        required: false
+        default: 30
+        type: number
+      use_vpn:
+        description: 'Use VPN (WARP) to bypass restrictions (may not work perfectly against bot detection)'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Start WARP VPN (if enabled)
+        if: github.event.inputs.use_vpn == 'true'
+        run: |
+          docker network create warp-net || true
+          docker run -d \
+            --name warp \
+            --restart=always \
+            --network warp-net \
+            -p 1080:1080 \
+            --cap-add NET_ADMIN \
+            -v warp-data:/var/lib/cloudflare-warp \
+            caomingjun/warp
+          echo "Waiting for WARP to initialize..."
+          sleep 15
+          curl -s --max-time 5 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace | grep warp || echo "WARP may not be active yet, continuing"
+
+      - name: Install dependencies
+        run: |
+          pip install playwright requests beautifulsoup4
+          playwright install chromium
+
+      - name: Fetch Pinterest search, extract text, links, download images, and conditionally save PDF
+        run: |
+          python3 << 'EOF'
+          from playwright.sync_api import sync_playwright, Error as PlaywrightError
+          from urllib.parse import urlparse, quote
+          import os, shutil, requests, re, time
+          from datetime import datetime
+
+          raw_query = "${{ github.event.inputs.search_query }}"
+          # Build Pinterest search URL: spaces become %20 (quote uses %20 by default)
+          encoded_query = quote(raw_query, safe='')
+          target_url = f"https://www.pinterest.com/search/pins/?q={encoded_query}"
+          print(f"Constructed Pinterest URL: {target_url}")
+
+          store_history = "${{ github.event.inputs.store_history }}" == "true"
+          use_vpn = "${{ github.event.inputs.use_vpn }}" == "true"
+          expand = "${{ github.event.inputs.expand_sections }}" == "true"
+          download_images = "${{ github.event.inputs.download_images }}" == "true"
+          save_pdf = "${{ github.event.inputs.save_pdf }}" == "true"
+          start_idx = int("${{ github.event.inputs.start_index }}")
+          end_idx = int("${{ github.event.inputs.end_index }}")
+          raw_formats = "${{ github.event.inputs.image_formats }}"
+          image_formats = [fmt.strip().lower() for fmt in raw_formats.split(',')]
+          clean_text_flag = "${{ github.event.inputs.clean_text }}" == "true"
+          timeout_ms = int("${{ github.event.inputs.timeout_seconds }}") * 1000
+          output_filename = "README.md"
+          images_dir = "images"
+          pdf_dir = "pdf"
+
+          print(f"Search query: {raw_query}")
+          print(f"Store history: {store_history}")
+          print(f"VPN enabled: {use_vpn}")
+          print(f"Expand sections: {expand}")
+          print(f"Download images: {download_images}")
+          print(f"Save PDF: {save_pdf}")
+          if download_images:
+              print(f"Image range: {start_idx} to {end_idx}")
+              print(f"Image formats: {image_formats}")
+          print(f"Clean text: {clean_text_flag}")
+          print(f"Timeout: {timeout_ms/1000} seconds")
+
+          proxy = None
+          if use_vpn:
+              proxy = {"server": "socks5://127.0.0.1:1080"}
+
+          # Unconditional cleanup of images/ and pdf/
+          if os.path.exists(images_dir):
+              shutil.rmtree(images_dir)
+          os.makedirs(images_dir)
+          print(f"Recreated empty {images_dir}/ folder")
+
+          if os.path.exists(pdf_dir):
+              shutil.rmtree(pdf_dir)
+          os.makedirs(pdf_dir)
+          print(f"Recreated empty {pdf_dir}/ folder")
+
+          # Helper: expand short URLs
+          def expand_short_url(url):
+              try:
+                  session = requests.Session()
+                  session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+                  resp = session.get(url, allow_redirects=True, timeout=10, stream=True)
+                  resp.close()
+                  return resp.url
+              except Exception as e:
+                  print(f"  Failed to expand {url}: {e}")
+                  return url
+
+          def clean_text(text):
+              if not clean_text_flag:
+                  return text
+              return re.sub(r'\n\s*\n\s*\n+', '\n\n', text)
+
+          def get_history_folder_name(url):
+              parsed = urlparse(url)
+              domain = parsed.netloc
+              domain = domain.split(':')[0]
+              if domain.startswith('www.'):
+                  domain = domain[4:]
+              folder_base = domain.replace('.', '_')
+              folder_base = re.sub(r'[^a-zA-Z0-9_-]', '', folder_base)
+              timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+              return f"{folder_base}_{timestamp}"
+
+          page_load_success = False
+          downloaded_images = []
+
+          with sync_playwright() as p:
+              browser = None
+              page = None
+              for attempt in range(1, 4):
+                  try:
+                      print(f"Attempt {attempt} to load page...")
+                      if page:
+                          page.close()
+                      if browser:
+                          browser.close()
+                      args = ['--disable-blink-features=AutomationControlled']
+                      if attempt > 1:
+                          args.append('--disable-http2')
+                          print("  -> Adding --disable-http2 to launch args")
+                      browser = p.chromium.launch(headless=True, proxy=proxy, args=args)
+                      page = browser.new_page()
+                      page.goto(target_url, timeout=timeout_ms, wait_until="networkidle")
+                      page_load_success = True
+                      print("Page loaded successfully")
+                      break
+                  except PlaywrightError as e:
+                      print(f"  Attempt {attempt} failed: {e}")
+                      if attempt == 3:
+                          print("  All attempts failed. Will extract whatever content has already loaded.")
+                          if page is None:
+                              raise
+                      time.sleep(2)
+
+              if not page_load_success and page is None:
+                  raise Exception("Could not load page after 3 attempts")
+
+              # Extract visible text
+              raw_text = page.evaluate("""
+                  () => {
+                      const body = document.body.cloneNode(true);
+                      body.querySelectorAll('script, style, meta, link').forEach(el => el.remove());
+                      return body.innerText || '';
+                  }
+              """)
+              visible_text = clean_text(raw_text)
+              print(f"Visible text length (raw: {len(raw_text)}, cleaned: {len(visible_text)})")
+
+              # Extract all links
+              all_links_raw = page.evaluate(f"""
+                  () => {{
+                      const base = '{target_url}';
+                      const links = new Set();
+                      for (const a of document.querySelectorAll('a[href]')) {{
+                          let href = a.getAttribute('href');
+                          if (!href || href.startsWith('javascript:') || href === '#') continue;
+                          try {{
+                              const absolute = new URL(href, base).href;
+                              if (absolute.startsWith('http:') || absolute.startsWith('https:'))
+                                  links.add(absolute);
+                          }} catch(e) {{}}
+                      }}
+                      return Array.from(links);
+                  }}
+              """)
+
+              SHORT_DOMAINS = ['bit.ly', 'tinyurl.com', 'goo.gl', 'ow.ly', 'is.gd', 'buff.ly', 'short.link']
+              link_display_items = []
+              for link in all_links_raw:
+                  parsed = urlparse(link)
+                  if any(domain in parsed.netloc for domain in SHORT_DOMAINS):
+                      print(f"Expanding short URL: {link}")
+                      expanded = expand_short_url(link)
+                      link_display_items.append((link, expanded))
+                  else:
+                      link_display_items.append((link, link))
+              print(f"Total unique links after expansion: {len(link_display_items)}")
+
+              # Image extraction
+              def matches_format(url):
+                  lower_url = url.lower()
+                  for fmt in image_formats:
+                      if lower_url.endswith(f'.{fmt}'):
+                          return True
+                  return False
+
+              image_urls = set()
+              all_expanded_urls = {expanded for (_, expanded) in link_display_items}
+              img_srcs = page.evaluate("""
+                  () => Array.from(document.querySelectorAll('img[src]')).map(img => img.src)
+              """)
+              for src in img_srcs:
+                  if src and src.startswith(('http://', 'https://')) and matches_format(src):
+                      image_urls.add(src)
+
+              for url in all_expanded_urls:
+                  if matches_format(url):
+                      image_urls.add(url)
+
+              bg_images = page.evaluate("""
+                  () => {
+                      const urls = [];
+                      for (const el of document.querySelectorAll('[style*="background"]')) {
+                          const style = getComputedStyle(el);
+                          const bg = style.backgroundImage;
+                          if (bg && bg !== 'none') {
+                              const match = bg.match(/url\\(["']?([^"')]+)["']?\\)/);
+                              if (match) urls.push(match[1]);
+                          }
+                      }
+                      return urls;
+                  }
+              """)
+              for bg in bg_images:
+                  if bg and matches_format(bg) and bg.startswith(('http://', 'https://')):
+                      image_urls.add(bg)
+
+              sorted_images = sorted(image_urls, key=lambda s: s.lower())
+              print(f"Total unique image URLs found: {len(sorted_images)}")
+
+              if download_images and sorted_images:
+                  start = max(0, start_idx - 1)
+                  end = min(len(sorted_images), end_idx)
+                  selected = sorted_images[start:end]
+                  print(f"Downloading images {start_idx} to {min(end_idx, len(sorted_images))}")
+
+                  session = requests.Session()
+                  if proxy:
+                      session.proxies = {'http': proxy['server'], 'https': proxy['server']}
+                  session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+
+                  for i, img_url in enumerate(selected, start=start_idx):
+                      try:
+                          parsed = urlparse(img_url)
+                          filename = os.path.basename(parsed.path)
+                          if not filename or '.' not in filename:
+                              ext = '.jpg'
+                              if '.png' in img_url.lower():
+                                  ext = '.png'
+                              elif '.gif' in img_url.lower():
+                                  ext = '.gif'
+                              filename = f"image_{i}{ext}"
+                          else:
+                              filename = re.sub(r'[\\/*?:"<>|]', '_', filename)
+
+                          filepath = os.path.join(images_dir, filename)
+                          if os.path.exists(filepath):
+                              name, ext = os.path.splitext(filename)
+                              filename = f"{name}_{i}{ext}"
+                              filepath = os.path.join(images_dir, filename)
+
+                          print(f"Downloading [{i}] {img_url[:80]}...")
+                          resp = session.get(img_url, timeout=20, stream=True)
+                          resp.raise_for_status()
+                          with open(filepath, 'wb') as f:
+                              for chunk in resp.iter_content(1024):
+                                  f.write(chunk)
+                          print(f"  Saved as {filename}")
+                          downloaded_images.append(filename)
+                      except Exception as e:
+                          print(f"  Failed to download {img_url}: {e}")
+
+              if save_pdf:
+                  try:
+                      timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                      parsed_domain = urlparse(target_url)
+                      domain_clean = parsed_domain.netloc.split(':')[0].replace('www.', '').replace('.', '_')
+                      pdf_filename = f"{domain_clean}_{timestamp}.pdf"
+                      pdf_path = os.path.join(pdf_dir, pdf_filename)
+                      page.pdf(path=pdf_path, format="A4", print_background=True)
+                      print(f"PDF saved to {pdf_path}")
+                  except Exception as e:
+                      print(f"PDF generation failed: {e}")
+              else:
+                  print("PDF saving disabled by user – skipping")
+
+              browser.close()
+
+          details_open = " open" if expand else ""
+          expand_summary = "Click to collapse" if expand else "Click to expand"
+
+          with open(output_filename, 'w', encoding='utf-8') as f:
+              f.write("# ModelmanEngine – Pinterest Search\n")
+              f.write("> 👤 *Created by **Hossein Alinaghipoor aka Modelman** – [YouTube Channel](http://www.youtube.com/@modelmananimation)*\n\n")
+              f.write(f"**Search query:** `{raw_query}`\n")
+              f.write(f"**Pinterest URL:** `{target_url}`\n\n")
+              f.write("**Jump to:** [🖼️ Images](#-images) · [📄 Text](#-text) · [🔗 Links](#-links)\n\n")
+
+              if download_images and downloaded_images:
+                  f.write("## 🖼️ Images\n\n")
+                  for img_file in downloaded_images:
+                      f.write(f"![{img_file}]({images_dir}/{img_file})\n\n")
+              elif download_images and not downloaded_images:
+                  f.write("## 🖼️ Images\n\n*No images found or downloaded.*\n\n")
+              else:
+                  f.write("## 🖼️ Images\n\n*Image downloading was disabled for this run.*\n\n")
+
+              f.write("## 📄 Text\n\n")
+              f.write(f"<details{details_open}>\n<summary>{expand_summary} (full page text)</summary>\n\n")
+              f.write("```\n")
+              f.write(visible_text.strip())
+              f.write("\n```\n\n")
+              f.write("</details>\n\n")
+
+              f.write("## 🔗 Links\n\n")
+              f.write(f"<details{details_open}>\n<summary>{expand_summary} (list of links)</summary>\n\n")
+              for original, expanded in sorted(link_display_items, key=lambda x: x[0]):
+                  if original != expanded:
+                      f.write(f"- {original} → <{expanded}>\n")
+                  else:
+                      f.write(f"- <{expanded}>\n")
+              f.write("\n</details>\n")
+
+          print(f"Successfully wrote {output_filename}.")
+          if download_images:
+              print(f"Images downloaded to '{images_dir}/' folder and linked in README.")
+
+          if store_history and page_load_success:
+              folder_name = get_history_folder_name(target_url)
+              history_path = os.path.join("History", folder_name)
+              os.makedirs(history_path, exist_ok=True)
+              print(f"Saving history snapshot to {history_path}")
+
+              shutil.copy2(output_filename, os.path.join(history_path, output_filename))
+
+              dest_images = os.path.join(history_path, images_dir)
+              if os.path.exists(dest_images):
+                  shutil.rmtree(dest_images)
+              shutil.copytree(images_dir, dest_images)
+              print(f"  Copied images/ to {dest_images}")
+
+              dest_pdf = os.path.join(history_path, pdf_dir)
+              if os.path.exists(dest_pdf):
+                  shutil.rmtree(dest_pdf)
+              shutil.copytree(pdf_dir, dest_pdf)
+              print(f"  Copied pdf/ to {dest_pdf}")
+
+          elif store_history and not page_load_success:
+              print("Page did not load successfully – skipping history snapshot")
+
+          EOF
+
+      - name: Commit changes to repo
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add README.md
+          git add images/ pdf/ || true
+          if [ -d "History" ]; then
+            git add History/
+          fi
+          git diff --cached --quiet || git commit -m "Pinterest search for '${{ github.event.inputs.search_query }}' [skip ci]"
+          git push
+
+      - name: Stop WARP container (if started)
+        if: always() && github.event.inputs.use_vpn == 'true'
+        run: docker stop warp || true
